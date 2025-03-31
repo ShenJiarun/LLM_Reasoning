@@ -22,6 +22,23 @@ from typing import Dict, Optional, Sequence, List
 logger = logging.getLogger(__name__)
 
 
+IGNORE_INDEX = -100
+PROMPT_DICT = {
+    "prompt_input": (
+        "<|im_start|>user\nA conversation between User and Assistant. "
+        "The user asks a question, and the Assistant solves it. "
+        "The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. "
+        "The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think><answer> answer here </answer>Put your final answer within \\\\boxed{}. {instruction}{input}<|im_end|>\n<|im_start|>assistant\n"
+    ),
+    "prompt_no_input": (
+        "<|im_start|>user\nA conversation between User and Assistant. "
+        "The user asks a question, and the Assistant solves it. "
+        "The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. "
+        "The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think><answer> answer here </answer>Put your final answer within \\\\boxed{{}}. {instruction}<|im_end|>\n<|im_start|>assistant\n"
+    ),
+}
+
+
 @dataclass
 class ModelArguments:
     model_name_or_path: Optional[str] = field(default="Qwen/Qwen2.5-1.5B-Instruct")
@@ -64,12 +81,9 @@ def get_all_datapath(dir_name: str) -> List[str]:
     else:
         return [dir_name], absolute_path
 
-    
-
 
 def load_dataset_from_path(data_path: Optional[str] = None,
                            cache_dir: Optional[str] = "cache_data") -> Dataset:
-    # breakpoint()
     all_file_list, absolute_path = get_all_datapath(data_path)
     data_files = {'train': all_file_list}
     extension = all_file_list[0].split(".")[-1]
@@ -82,37 +96,6 @@ def load_dataset_from_path(data_path: Optional[str] = None,
         cache_dir=cache_dir,
     )['train']
     return raw_datasets
-
-
-IGNORE_INDEX = -100
-# PROMPT_DICT = {
-#     "prompt_input": (
-#         "<|im_start|>user\nA conversation between User and Assistant. "
-#         "The user asks a question, and the Assistant solves it. "
-#         "The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. "
-#         "The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think><answer> answer here </answer>Put your final answer within \\\\boxed{}. {content}{{input}}<|im_end|>\n<|im_start|>assistant\n"
-#     ),
-#     "prompt_no_input": (
-#         "<|im_start|>user\nA conversation between User and Assistant. "
-#         "The user asks a question, and the Assistant solves it. "
-#         "The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. "
-#         "The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think><answer> answer here </answer>Put your final answer within \\\\boxed{}. {content}<|im_end|>\n<|im_start|>assistant\n"
-#     ),
-# }
-PROMPT_DICT = {
-    "prompt_input": (
-        "<|im_start|>user\nA conversation between User and Assistant. "
-        "The user asks a question, and the Assistant solves it. "
-        "The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. "
-        "The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think><answer> answer here </answer>Put your final answer within \\\\boxed{}. {instruction}{input}<|im_end|>\n<|im_start|>assistant\n"
-    ),
-    "prompt_no_input": (
-        "<|im_start|>user\nA conversation between User and Assistant. "
-        "The user asks a question, and the Assistant solves it. "
-        "The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. "
-        "The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think><answer> answer here </answer>Put your final answer within \\\\boxed{{}}. {instruction}<|im_end|>\n<|im_start|>assistant\n"
-    ),
-}
 
 
 def _tokenize_fn(strings: Sequence[str], tokenizer: transformers.PreTrainedTokenizer) -> Dict:
@@ -176,20 +159,7 @@ def make_train_dataset(tokenizer: transformers.PreTrainedTokenizer, data_path: s
 
         len_ = len(ins_data)
 
-        # sources = []
-        # targets = []
-
-        # for i in range(len_):
-        #     s_t = prompt_input.format_map({'instruction':ins_data[i],
-        #                                    'input':input_data[i]}) if input_data[i] != "" else prompt_input.format_map({'instruction':ins_data[i]})
-        #     sources.append(s_t)
-
-        # sources = [prompt_input.format_map({'instruction': ins_data[i], 'input': input_data[i]}) if input_data[
-        #     i] != "" else prompt_no_input.format_map(
-        #     {'instruction': ins_data[i]})
-        #     for i in range(len_)]
         sources = []
-        # breakpoint()
         for i in range(len_):
             if input_data[i] != "":
                 current_data = prompt_input.format_map({'instruction': ins_data[i], 'input': input_data[i]})
@@ -200,10 +170,6 @@ def make_train_dataset(tokenizer: transformers.PreTrainedTokenizer, data_path: s
         targets = [
             f"{example[:data_args.target_length-1]}{tokenizer.eos_token}" for example in output]
 
-        # sources = [prompt_input.format_map(example) if example.get("input", "") != "" else prompt_no_input.format_map(example)
-        #            for example in examples]
-        # targets = [
-        #     f"{example['output']}{tokenizer.eos_token}" for example in examples]
 
         input_output = preprocess(
             sources=sources, targets=targets, tokenizer=tokenizer)
@@ -256,10 +222,12 @@ def load_model_and_tokenizer(model_args: ModelArguments, training_args: Training
             bias="none",
             task_type="CAUSAL_LM",
         )
+        
         # model = model.to(torch.bfloat16)
         model = get_peft_model(model, config)
         # peft_module_casting_to_bf16(model)
         model.print_trainable_parameters()
+
 
     # model.is_parallelizable = True
     # model.model_parallel = True

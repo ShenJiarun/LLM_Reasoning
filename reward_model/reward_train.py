@@ -44,16 +44,11 @@ train_dataset = train_dataset.filter(
     and len(x["input_ids_rejected"]) <= 512
 )
 
-from transformers import AutoModelForSequenceClassification, BitsAndBytesConfig
+from transformers import AutoModelForSequenceClassification
 
-quantization_config = BitsAndBytesConfig(
-    load_in_8bit=False,
-    load_in_4bit=True
-)
 
 model = AutoModelForSequenceClassification.from_pretrained(
-    "facebook/opt-350m",
-    quantization_config=quantization_config,
+    "",
     device_map={"": 0},
     trust_remote_code=True,
     num_labels=1,
@@ -66,16 +61,16 @@ from peft import LoraConfig
 from trl import RewardTrainer
 
 training_args = TrainingArguments(
-    output_dir="./train_logs",  # 出力フォルダ
-    max_steps=300,  # 学習ステップ数
-    per_device_train_batch_size=4,  # 学習用のGPUあたりのバッチサイズ
-    gradient_accumulation_steps=1,  # 勾配を蓄積するための更新ステップの数
-    learning_rate=1.41e-5,  # 学習率
-    optim="adamw_torch",  # オプティマイザ
-    save_steps=50,  # 何ステップ毎にチェックポイントを保存するか
-    logging_steps=50,  # 何ステップ毎にログを記録するか
-    report_to="tensorboard",  # レポート
-    remove_unused_columns=False,  # 不使用列の削除
+    output_dir="./train_logs",
+    max_steps=300,
+    per_device_train_batch_size=4,
+    gradient_accumulation_steps=1,
+    learning_rate=1.41e-5,
+    optim="adamw_torch",
+    save_steps=50,
+    logging_steps=50,
+    report_to="tensorboard",
+    remove_unused_columns=False,
 )
 
 peft_config = LoraConfig(

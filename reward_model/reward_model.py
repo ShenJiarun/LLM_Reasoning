@@ -23,5 +23,5 @@ class RewardModel(nn.Module):
         reward = self.reward_head(hidden_state)
         return reward
 
-model_name = "your-base-model"
+model_name = ""
 reward_model = RewardModel(model_name)
