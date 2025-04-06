@@ -63,26 +63,41 @@ def format_sharegpt_dataset(args):
         json.dump(output_dataset, f, indent=4, ensure_ascii=False)
 
 
-def format_trl_dataset(args):
+def format_implicit_prompt_preference_dataset(args):
     output_dataset = []
+    readin_accept_data = read_jsonl_to_list(args, args.input_accept)
+    readin_reject_data = read_jsonl_to_list(args, args.input_reject)
     
+    assert len(readin_accept_data) == len(readin_reject_data), "Your input accept data and reject data must be of same length."
     
+    for index in range(len(readin_accept_data)):
+        assert readin_accept_data[index]["prompt"] == readin_reject_data[index]["prompt"]
+        prompt = readin_accept_data[index]["prompt"]
+        raw_data = { "chosen": [{"content": prompt, "role": "user"},
+                    {"content": readin_accept_data[index]["output"], "role": "assistant"}
+                    ],
+                     "rejected": [{"content": prompt, "role": "user"},
+                    {"content": readin_reject_data[index]["output"], "role": "assistant"}
+                    ]
+        }
     
-    with jsonlines.open(args.output_path, mode="w") as writer:
-        writer.write_all(output_dataset)
+        output_dataset.append(raw_data)
+
+    df = pd.DataFrame(output_dataset)
+    df.to_parquet(args.output_path, engine='pyarrow', index=False)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--input-accept', '--accept', help='Your accepted data path.')
     parser.add_argument('--input-reject', '--output', help='Your rejected data path.')
-    parser.add_argument('--output-format', type=str, choices=['sharegpt', 'trl'],
+    parser.add_argument('--output-format', type=str, choices=['sharegpt_preference', 'implicit_prompt_preference'],
                         default='sharegpt', help='Your output data format.')
     parser.add_argument('--output-path', type=str, help='Your output data directory.')
 
     args = parser.parse_args()
 
-    if args.output_format and args.output_format == "sharegpt":
+    if args.output_format and args.output_format == "sharegpt_preference":
         format_sharegpt_dataset(args)
-    elif args.output_format and args.output_format == "trl":
-        format_trl_dataset(args)
+    elif args.output_format and args.output_format == "implicit_prompt_preference":
+        format_implicit_prompt_preference_dataset(args)
