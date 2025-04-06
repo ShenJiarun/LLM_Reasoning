@@ -1,94 +1,70 @@
-from transformers import AutoTokenizer
+import warnings
 
-
-tokenizer = AutoTokenizer.from_pretrained(
-    ""
-)
-
+import torch
 from datasets import load_dataset
+from transformers import AutoModelForSequenceClassification, AutoTokenizer, HfArgumentParser
 
-train_dataset = load_dataset("Anthropic/hh-rlhf", split="train")
-
-print(train_dataset)
-print("--chosen--")
-print(train_dataset[4]["chosen"])
-print("--rejected--")
-print(train_dataset[4]["rejected"])
-
-def preprocess_function(examples):
-    new_examples = {
-        "input_ids_chosen": [],
-        "attention_mask_chosen": [],
-        "input_ids_rejected": [],
-        "attention_mask_rejected": [],
-    }
-    for chosen, rejected in zip(examples["chosen"], examples["rejected"]):
-        tokenized_j = tokenizer(chosen, truncation=True)
-        tokenized_k = tokenizer(rejected, truncation=True)
-
-        new_examples["input_ids_chosen"].append(tokenized_j["input_ids"])
-        new_examples["attention_mask_chosen"].append(tokenized_j["attention_mask"])
-        new_examples["input_ids_rejected"].append(tokenized_k["input_ids"])
-        new_examples["attention_mask_rejected"].append(tokenized_k["attention_mask"])
-
-    return new_examples
-
-
-train_dataset = train_dataset.map(
-    preprocess_function,
-    batched=True,
-    num_proc=4,
-)
-train_dataset = train_dataset.filter(
-    lambda x: len(x["input_ids_chosen"]) <= 512
-    and len(x["input_ids_rejected"]) <= 512
+from trl import (
+    ModelConfig,
+    RewardConfig,
+    RewardTrainer,
+    ScriptArguments,
+    get_kbit_device_map,
+    get_peft_config,
+    get_quantization_config,
+    setup_chat_format,
 )
 
-from transformers import AutoModelForSequenceClassification
 
+if __name__ == "__main__":
+    parser = HfArgumentParser((ScriptArguments, RewardConfig, ModelConfig))
+    script_args, training_args, model_args = parser.parse_args_into_dataclasses()
+    training_args.gradient_checkpointing_kwargs = dict(use_reentrant=False)
 
-model = AutoModelForSequenceClassification.from_pretrained(
-    "",
-    device_map={"": 0},
-    trust_remote_code=True,
-    num_labels=1,
-)
-model.config.use_cache = False
+    # Model & Tokenizer
+    torch_dtype = (
+        model_args.torch_dtype if model_args.torch_dtype in ["auto", None] else getattr(torch, model_args.torch_dtype)
+    )
+    quantization_config = get_quantization_config(model_args)
+    model_kwargs = dict(
+        revision=model_args.model_revision,
+        device_map=get_kbit_device_map() if quantization_config is not None else None,
+        quantization_config=quantization_config,
+        use_cache=False if training_args.gradient_checkpointing else True,
+        torch_dtype=torch_dtype,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_args.model_name_or_path, trust_remote_code=model_args.trust_remote_code, use_fast=True
+    )
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_args.model_name_or_path, num_labels=1, trust_remote_code=model_args.trust_remote_code, **model_kwargs
+    )
+    # Align padding tokens between tokenizer and model
+    model.config.pad_token_id = tokenizer.pad_token_id
 
+    # If post-training a base model, use ChatML as the default template
+    if tokenizer.chat_template is None:
+        model, tokenizer = setup_chat_format(model, tokenizer)
 
-from transformers import TrainingArguments
-from peft import LoraConfig
-from trl import RewardTrainer
+    if model_args.use_peft and model_args.lora_task_type != "SEQ_CLS":
+        warnings.warn(
+            "You are using a `task_type` that is different than `SEQ_CLS` for PEFT. This will lead to silent bugs"
+            " Make sure to pass --lora_task_type SEQ_CLS when using this script with PEFT.",
+            UserWarning,
+        )
 
-training_args = TrainingArguments(
-    output_dir="./train_logs",
-    max_steps=300,
-    per_device_train_batch_size=4,
-    gradient_accumulation_steps=1,
-    learning_rate=1.41e-5,
-    optim="adamw_torch",
-    save_steps=50,
-    logging_steps=50,
-    report_to="tensorboard",
-    remove_unused_columns=False,
-)
+    # Load dataset
+    dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
 
-peft_config = LoraConfig(
-    r=16,
-    lora_alpha=16,
-    bias="none",
-    task_type="SEQ_CLS",
-    modules_to_save=["scores"]
-)
+    # Training
+    trainer = RewardTrainer(
+        model=model,
+        processing_class=tokenizer,
+        args=training_args,
+        train_dataset=dataset[script_args.dataset_train_split],
+        eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
+        peft_config=get_peft_config(model_args),
+    )
+    trainer.train()
 
-trainer = RewardTrainer(
-    model=model,
-    tokenizer=tokenizer,
-    args=training_args,
-    train_dataset=train_dataset,
-    peft_config=peft_config,
-    max_length=512,
-)
-
-trainer.train()
-trainer.model.save_pretrained("./reward_model")
+    trainer.save_model(training_args.output_dir)
