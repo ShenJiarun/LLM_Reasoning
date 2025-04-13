@@ -41,22 +41,18 @@ def blending_datasets(
         dataset_basename = os.path.basename(dataset)
 
         ext = os.path.splitext(dataset)[-1]
-        # local python script
         if ext == ".py" or (os.path.isdir(dataset) and os.path.exists(os.path.join(dataset, f"{dataset_basename}.py"))):
             data = load_dataset(dataset, trust_remote_code=True)
             strategy.print(f"loaded {dataset} with python script")
-        # local text file
         elif ext in [".json", ".jsonl", ".csv"]:
             ext = ext.lower().strip(".")
             if ext == "jsonl":
                 ext = "json"
             data = load_dataset(ext, data_files=dataset)
             strategy.print(f"loaded {dataset} with data_files={dataset}")
-        # local dataset saved with `datasets.Dataset.save_to_disk`
         elif os.path.isdir(dataset):
             data = load_from_disk(dataset)
             strategy.print(f"loaded {dataset} from disk")
-        # remote/local folder or common file
         else:
             data = load_dataset(dataset, data_dir=data_dir)
             strategy.print(f"loaded {dataset} from files")
@@ -67,7 +63,6 @@ def blending_datasets(
             train_data = data.select(range(min(max_count, len(data))))
         train_data_list.append(train_data)
 
-    # merge datasets
     if strategy.is_rank_0():
         print(train_data_list)
 
@@ -105,7 +100,6 @@ class PromptGtAnswerDataset(Dataset):
         self.strategy = strategy
         self.tokenizer = tokenizer
 
-        # chat_template
         self.input_template = input_template
 
         input_key = self.strategy.args.map_keys.get("prompt", None)
@@ -131,24 +125,102 @@ class PromptGtAnswerDataset(Dataset):
         return {"prompt": self.prompts[idx], "gt_answer": self.gt_answers[idx]}
 
 
-def apply_GenRM_template(prompt_text, response_text, ground_truth_answer_text):
+def apply_GenRM_template(prompt_text, response_text, ground_truth_answer_text, language):
     if ground_truth_answer_text:
-        full_input = f"""你是一个判别推理正确性的专家。
-                    [PROMPT]：{prompt_text}
-                    [RESPONSE]：{response_text}
-                    [REFERENCE]：{ground_truth_answer_text}
-                    任务目标：根据给定的问题[PROMPT]和参考答案[REFERENCE]，评估回复质量[RESPONSE]，考虑语言一致性、\
-                    格式正确性、最终结果正确性、推理合理性、回复无害性、语句重复冗余性，用简洁的文字说明原因，不需要给出改进答案。\
-                    最后给出0到1之间的分数，分数以<score></score>的形式给出。
-                    """
+        if language == "zh":
+            full_input = f"""
+                    你是一名专家，负责评估语言模型助手对数学问题的回答表现。下面给出一个数学问题和对应的回答，你需要根据10分制对该回答进行评分，
+                    其中1分为最差，10分为最佳。
+                    你应考虑以下方面来评估回答：
+                    正确性：解题思路和最终答案是否正确。如果最终答案错误，最高不超过5分。
+                    完整性：是否完整展示了解题过程,包括关键步骤和推导过程。
+                    清晰性：解题过程的表述是否清晰,公式符号使用是否规范。
+                    教学价值：是否解释了重要概念,帮助理解问题。
+                    打分标准：
+                    [1-2] 低：答案错误,且解题思路存在严重错误,或未给出任何解题过程。
+                    [3-4] 中等：答案可能正确但解题思路有误,或解题过程严重不完整。
+                    [5-6] 高：答案和主要解题思路正确,但解题过程不够完整或清晰,缺乏必要解释。
+                    [7-8] 非常高：答案正确,解题过程完整且清晰,但可能在某些细节上略显不足。
+                    [9-10] 优异：答案完全正确,解题过程非常完整清晰,概念解释到位,具有很好的教学价值。
+                    请首先从正确性、完整性、清晰性、教学价值这几个方面对回答进行分析，然后罗列出回答的优缺点，最后给出总体评分，注意总体评分应
+                    该是一个1到10之间(包括1和10)的整数。
+
+                    问题
+                    {prompt_text}
+
+                    回答
+                    {response_text}
+                    
+                    参考答案
+                    {ground_truth_answer_text}
+
+                    分析
+                    [你的分析内容]
+
+                    总体评分
+                    请将分数用<score></score>标记输出，即以<score>分数</score>的格式输出
+                """
+        elif language == "en":
+            full_input = f"""You are an expert responsible for evaluating the performance of a language model assistant in answering math problems. Below is a math problem along with its corresponding answer. You need to rate the answer on a scale of 1 to 10, where 1 is the worst and 10 is the best.\n
+                You should consider the following aspects when evaluating the answer:\n
+                Proper Tag Pairing: Always check that the `<think>` tag has a corresponding `</think>` tag, and the `<answer>` tag has a corresponding `</answer>` tag, with no overlapping or mixed content between them.\n
+                Separation of Reasoning and Answer: Always enclose the complete chain-of-thought in `<think>` and `</think>` tags, and place the final computed answer in `<answer>` and `</answer>` tags immediately after.\n
+                Complete Step-by-Step Explanation: Ensure the reasoning includes every important detail, such as intermediate steps, assumptions, substitutions, and simplifications, so that the derivation is clear and understandable.\n
+                Clear and Organized Presentation: Write the chain-of-thought in a logical, structured manner using clear language, proper formatting (with LaTeX for equations when needed), and natural breaks to enhance readability.\n
+                Logical Consistency and Verification: Each step in the reasoning should logically follow from the previous one. The chain-of-thought must allow a reviewer to replicate the derivation and arrive at the same final answer.\n
+                Uniformity Across Problems: Apply the same detailed formatting and level of explanation across all problems to maintain a consistent style and facilitate reliable scoring by evaluation systems.\n
+                Conciseness and Readability: While providing detailed reasoning is key, ensure every sentence is purposeful. Avoid unnecessary verbosity, keeping the explanation neat, precise, and free of ambiguities.\n
+                [PROMPT]: {prompt_text}
+                [RESPONSE]: {response_text}
+                Task Objective: Based on the given problem [PROMPT], evaluate the response quality [RESPONSE], considering Proper Tag Pairing, Separation of Reasoning and Answer, Complete Step-by-Step Explanation, Clear and Organized Presentation, Logical Consistency and Verification, Uniformity Across Problems, and Conciseness and Readability. Use concise language to explain your reasons; you do not need to provide an improved answer. Finally, assign a score between 1 and 10, with the score enclosed in <score></score>.
+                """
     else:
-        full_input = f"""你是一个判别推理正确性的专家。
-                    [PROMPT]：{prompt_text}
-                    [RESPONSE]：{response_text}
-                    任务目标：根据给定的问题[PROMPT]，评估回复质量[RESPONSE]，考虑语言一致性、格式正确性、\
-                    最终结果正确性、推理合理性、回复无害性、语句重复冗余性，用简洁的文字说明原因，不需要给出改进答案。\
-                    最后给出0到1之间的分数，分数以<score></score>的形式给出。
+        if language == "zh":
+            full_input = f"""
+                    你是一名专家，负责评估语言模型助手对数学问题的回答表现。下面给出一个数学问题和对应的回答，你需要根据10分制对该回答进行评分，
+                    其中1分为最差，10分为最佳。
+                    你应考虑以下方面来评估回答：
+                    正确性：解题思路和最终答案是否正确。如果最终答案错误，最高不超过5分。
+                    完整性：是否完整展示了解题过程,包括关键步骤和推导过程。
+                    清晰性：解题过程的表述是否清晰,公式符号使用是否规范。
+                    教学价值：是否解释了重要概念,帮助理解问题。
+                    打分标准：
+                    [1-2] 低：答案错误,且解题思路存在严重错误,或未给出任何解题过程。
+                    [3-4] 中等：答案可能正确但解题思路有误,或解题过程严重不完整。
+                    [5-6] 高：答案和主要解题思路正确,但解题过程不够完整或清晰,缺乏必要解释。
+                    [7-8] 非常高：答案正确,解题过程完整且清晰,但可能在某些细节上略显不足。
+                    [9-10] 优异：答案完全正确,解题过程非常完整清晰,概念解释到位,具有很好的教学价值。
+                    请首先从正确性、完整性、清晰性、教学价值这几个方面对回答进行分析，然后罗列出回答的优缺点，最后给出总体评分，注意总体评分应
+                    该是一个1到10之间(包括1和10)的整数。
+
+                    问题
+                    {prompt_text}
+
+                    回答
+                    {response_text}
+
+                    分析
+                    [你的分析内容]
+
+                    总体评分
+                    请将分数用<score></score>标记输出，即以<score>分数</score>的格式输出
                     """
+        elif language == "en":
+            full_input = f"""You are an expert responsible for evaluating the performance of a language model assistant in answering math problems. Below is a math problem along with its corresponding answer. You need to rate the answer on a scale of 1 to 10, where 1 is the worst and 10 is the best.\n
+                You should consider the following aspects when evaluating the answer:\n
+                Proper Tag Pairing: Always check that the `<think>` tag has a corresponding `</think>` tag, and the `<answer>` tag has a corresponding `</answer>` tag, with no overlapping or mixed content between them.\n
+                Separation of Reasoning and Answer: Always enclose the complete chain-of-thought in `<think>` and `</think>` tags, and place the final computed answer in `<answer>` and `</answer>` tags immediately after.\n
+                Complete Step-by-Step Explanation: Ensure the reasoning includes every important detail, such as intermediate steps, assumptions, substitutions, and simplifications, so that the derivation is clear and understandable.\n
+                Clear and Organized Presentation: Write the chain-of-thought in a logical, structured manner using clear language, proper formatting (with LaTeX for equations when needed), and natural breaks to enhance readability.\n
+                Logical Consistency and Verification: Each step in the reasoning should logically follow from the previous one. The chain-of-thought must allow a reviewer to replicate the derivation and arrive at the same final answer.\n
+                Uniformity Across Problems: Apply the same detailed formatting and level of explanation across all problems to maintain a consistent style and facilitate reliable scoring by evaluation systems.\n
+                Conciseness and Readability: While providing detailed reasoning is key, ensure every sentence is purposeful. Avoid unnecessary verbosity, keeping the explanation neat, precise, and free of ambiguities.\n
+                [PROMPT]: {prompt_text}
+                [RESPONSE]: {response_text}
+                [REFERENCE]: {ground_truth_answer_text}
+                Task Objective: Based on the given problem [PROMPT] and reference answer [REFERENCE], evaluate the response quality [RESPONSE], considering Proper Tag Pairing, Separation of Reasoning and Answer, Complete Step-by-Step Explanation, Clear and Organized Presentation, Logical Consistency and Verification, Uniformity Across Problems, and Conciseness and Readability. Use concise language to explain your reasons; you do not need to provide an improved answer. Finally, assign a score between 1 and 10, with the score enclosed in <score></score>.
+                """
+
     return full_input
 
 
@@ -244,7 +316,6 @@ def extract_answer(pred_str, data_name, use_last_number=True):
         return choice_answer_clean(pred_str)
 
     if "final answer is $" in pred_str and "$. I hope" in pred_str:
-        # minerva_math
         tmp = pred_str.split("final answer is $", 1)[1]
         pred = tmp.split("$. I hope", 1)[0].strip()
     elif "boxed" in pred_str:
@@ -273,9 +344,8 @@ def extract_answer(pred_str, data_name, use_last_number=True):
     elif "final answer is" in pred_str:
         pred = pred_str.split("final answer is")[-1].strip()
     elif "答案是" in pred_str:
-        # Handle Chinese few-shot multiple choice problem answer extraction
         pred = pred_str.split("答案是")[1].strip().split("\n\n")[0].strip()
-    else:  # use the last number
+    else:
         if use_last_number:
             pattern = "-?\d*\.?\d+"
             pred = re.findall(pattern, pred_str.replace(",", ""))
@@ -286,7 +356,6 @@ def extract_answer(pred_str, data_name, use_last_number=True):
         else:
             pred = ""
 
-    # choice answer
     if (
         data_name in ["sat_math", "aqua"]
         or "mmlu" in data_name
@@ -297,7 +366,6 @@ def extract_answer(pred_str, data_name, use_last_number=True):
         else:
             pred = pred.strip().strip(".")
 
-    # multiple line
     pred = re.sub(r"\n\s*", "", pred)
     if pred != "" and pred[0] == ":":
         pred = pred[1:]
@@ -310,7 +378,6 @@ def extract_answer(pred_str, data_name, use_last_number=True):
 
 
 def is_digit(num):
-    # paired with parse_digits
     return parse_digits(num) is not None
 
 
@@ -349,54 +416,44 @@ def strip_string(string, skip_unit=False):
         .replace("\\geq", "\\ge")
     )
 
-    # remove \left and \right
     string = string.replace("\\left", "")
     string = string.replace("\\right", "")
     string = string.replace("\\{", "{")
     string = string.replace("\\}", "}")
 
-    # Remove unit: miles, dollars if after is not none
     _string = re.sub(r"\\text{.*?}$", "", string).strip()
     if _string != "" and _string != string:
         string = _string
 
     if not skip_unit:
-        # Remove unit: texts
         for _ in range(2):
             for unit_text in unit_texts:
                 _string = re.sub(r"(^|\W)" + unit_text + r"($|\W)", r"\1\2", string)
                 if _string != "":
                     string = _string
 
-    # Remove circ (degrees)
     string = string.replace("^{\\circ}", "")
     string = string.replace("^\\circ", "")
 
-    # remove dollar signs
     string = string.replace("\\$", "")
     string = string.replace("$", "")
     string = string.replace("\\(", "").replace("\\)", "")
 
-    # convert word number to digit
     string = convert_word_number(string)
 
-    # replace "\\text{...}" to "..."
     string = re.sub(r"\\text\{(.*?)\}", r"\1", string)
     for key in ["x=", "y=", "z=", "x\\in", "y\\in", "z\\in", "x\\to", "y\\to", "z\\to"]:
         string = string.replace(key, "")
     string = string.replace("\\emptyset", r"{}")
     string = string.replace("(-\\infty,\\infty)", "\\mathbb{R}")
 
-    # remove percentage
     string = string.replace("\\%", "")
     string = string.replace("\%", "")
     string = string.replace("%", "")
 
-    # " 0." equivalent to " ." and "{0." equivalent to "{." Alternatively, add "0" if "." is the start of the string
     string = string.replace(" .", " 0.")
     string = string.replace("{.", "{0.")
 
-    # cdot
     if (
         string.startswith("{")
         and string.endswith("}")
@@ -410,38 +467,30 @@ def strip_string(string, skip_unit=False):
     ):
         string = string[1:-1]
 
-    # inf
     string = string.replace("infinity", "\\infty")
     if "\\infty" not in string:
         string = string.replace("inf", "\\infty")
     string = string.replace("+\\inity", "\\infty")
 
-    # and
     string = string.replace("and", "")
     string = string.replace("\\mathbf", "")
 
-    # use regex to remove \mbox{...}
     string = re.sub(r"\\mbox{.*?}", "", string)
 
-    # quote
     string.replace("'", "")
     string.replace('"', "")
 
-    # i, j
     if "j" in string and "i" not in string:
         string = string.replace("j", "i")
 
-    # replace a.000b where b is not number or b is end, with ab, use regex
     string = re.sub(r"(\d+)\.0*([^\d])", r"\1\2", string)
     string = re.sub(r"(\d+)\.0*$", r"\1", string)
 
-    # if empty, return empty string
     if len(string) == 0:
         return string
     if string[0] == ".":
         string = "0" + string
 
-    # to consider: get rid of e.g. "k = " or "q = " at beginning
     if len(string.split("=")) == 2:
         if len(string.split("=")[0]) <= 2:
             string = string.split("=")[1]
@@ -517,7 +566,6 @@ def convert_word_number(text: str) -> str:
     return text
 
 
-# units mainly from MathQA
 unit_texts = [
     "east",
     "degree",
@@ -675,54 +723,44 @@ def strip_string(string, skip_unit=False):
         .replace("\\geq", "\\ge")
     )
 
-    # remove \left and \right
     string = string.replace("\\left", "")
     string = string.replace("\\right", "")
     string = string.replace("\\{", "{")
     string = string.replace("\\}", "}")
 
-    # Remove unit: miles, dollars if after is not none
     _string = re.sub(r"\\text{.*?}$", "", string).strip()
     if _string != "" and _string != string:
         string = _string
 
     if not skip_unit:
-        # Remove unit: texts
         for _ in range(2):
             for unit_text in unit_texts:
                 _string = re.sub(r"(^|\W)" + unit_text + r"($|\W)", r"\1\2", string)
                 if _string != "":
                     string = _string
 
-    # Remove circ (degrees)
     string = string.replace("^{\\circ}", "")
     string = string.replace("^\\circ", "")
 
-    # remove dollar signs
     string = string.replace("\\$", "")
     string = string.replace("$", "")
     string = string.replace("\\(", "").replace("\\)", "")
 
-    # convert word number to digit
     string = convert_word_number(string)
 
-    # replace "\\text{...}" to "..."
     string = re.sub(r"\\text\{(.*?)\}", r"\1", string)
     for key in ["x=", "y=", "z=", "x\\in", "y\\in", "z\\in", "x\\to", "y\\to", "z\\to"]:
         string = string.replace(key, "")
     string = string.replace("\\emptyset", r"{}")
     string = string.replace("(-\\infty,\\infty)", "\\mathbb{R}")
 
-    # remove percentage
     string = string.replace("\\%", "")
     string = string.replace("\%", "")
     string = string.replace("%", "")
 
-    # " 0." equivalent to " ." and "{0." equivalent to "{." Alternatively, add "0" if "." is the start of the string
     string = string.replace(" .", " 0.")
     string = string.replace("{.", "{0.")
 
-    # cdot
     if (
         string.startswith("{")
         and string.endswith("}")
@@ -736,38 +774,30 @@ def strip_string(string, skip_unit=False):
     ):
         string = string[1:-1]
 
-    # inf
     string = string.replace("infinity", "\\infty")
     if "\\infty" not in string:
         string = string.replace("inf", "\\infty")
     string = string.replace("+\\inity", "\\infty")
 
-    # and
     string = string.replace("and", "")
     string = string.replace("\\mathbf", "")
 
-    # use regex to remove \mbox{...}
     string = re.sub(r"\\mbox{.*?}", "", string)
 
-    # quote
     string.replace("'", "")
     string.replace('"', "")
 
-    # i, j
     if "j" in string and "i" not in string:
         string = string.replace("j", "i")
 
-    # replace a.000b where b is not number or b is end, with ab, use regex
     string = re.sub(r"(\d+)\.0*([^\d])", r"\1\2", string)
     string = re.sub(r"(\d+)\.0*$", r"\1", string)
 
-    # if empty, return empty string
     if len(string) == 0:
         return string
     if string[0] == ".":
         string = "0" + string
 
-    # to consider: get rid of e.g. "k = " or "q = " at beginning
     if len(string.split("=")) == 2:
         if len(string.split("=")[0]) <= 2:
             string = string.split("=")[1]
@@ -798,7 +828,6 @@ direct_answer_trigger_for_fewshot = ("choice is", "answer is")
 def choice_answer_clean(pred: str):
     pred = pred.strip("\n")
 
-    # Determine if this is ICL, if so, use \n\n to split the first chunk.
     ICL = False
     for trigger in direct_answer_trigger_for_fewshot:
         if pred.count(trigger) > 1:
@@ -806,7 +835,6 @@ def choice_answer_clean(pred: str):
     if ICL:
         pred = pred.split("\n\n")[0]
 
-    # Split the trigger to find the answer.
     preds = re.split("|".join(direct_answer_trigger_for_fewshot), pred)
     if len(preds) > 1:
         answer_flag = True
@@ -816,7 +844,6 @@ def choice_answer_clean(pred: str):
 
     pred = pred.strip("\n").rstrip(".").rstrip("/").strip(" ").lstrip(":")
 
-    # Clean the answer based on the dataset
     tmp = re.findall(r"\b(A|B|C|D|E)\b", pred.upper())
     if tmp:
         pred = tmp
@@ -827,13 +854,10 @@ def choice_answer_clean(pred: str):
         pred = ""
     else:
         if answer_flag:
-            # choose the first element in list ...
             pred = pred[0]
         else:
-            # choose the last e
             pred = pred[-1]
 
-    # Remove the period at the end, again!
     pred = pred.rstrip(".").rstrip("/")
 
     return pred
@@ -845,7 +869,6 @@ def extract_answer(pred_str, data_name, use_last_number=True):
         return choice_answer_clean(pred_str)
 
     if "final answer is $" in pred_str and "$. I hope" in pred_str:
-        # minerva_math
         tmp = pred_str.split("final answer is $", 1)[1]
         pred = tmp.split("$. I hope", 1)[0].strip()
     elif "boxed" in pred_str:
@@ -874,9 +897,8 @@ def extract_answer(pred_str, data_name, use_last_number=True):
     elif "final answer is" in pred_str:
         pred = pred_str.split("final answer is")[-1].strip()
     elif "答案是" in pred_str:
-        # Handle Chinese few-shot multiple choice problem answer extraction
         pred = pred_str.split("答案是")[1].strip().split("\n\n")[0].strip()
-    else:  # use the last number
+    else:
         if use_last_number:
             pattern = "-?\d*\.?\d+"
             pred = re.findall(pattern, pred_str.replace(",", ""))
@@ -887,7 +909,6 @@ def extract_answer(pred_str, data_name, use_last_number=True):
         else:
             pred = ""
 
-    # choice answer
     if (
         data_name in ["sat_math", "aqua"]
         or "mmlu" in data_name
@@ -898,7 +919,6 @@ def extract_answer(pred_str, data_name, use_last_number=True):
         else:
             pred = pred.strip().strip(".")
 
-    # multiple line
     pred = re.sub(r"\n\s*", "", pred)
     if pred != "" and pred[0] == ":":
         pred = pred[1:]
@@ -942,7 +962,6 @@ def math_equal(
         if is_digit(prediction) and is_digit(reference):
             prediction = parse_digits(prediction)
             reference = parse_digits(reference)
-            # number questions
             if include_percentage:
                 gt_result = [reference / 100, reference, reference * 100]
             else:

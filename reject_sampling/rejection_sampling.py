@@ -2,6 +2,7 @@ import argparse
 import gc
 import json
 import re
+import logging
 
 import jsonlines
 import pandas as pd
@@ -12,6 +13,20 @@ from vllm import LLM, SamplingParams
 from vllm.distributed.parallel_state import (destroy_distributed_environment, destroy_model_parallel)
 
 from utils import blending_datasets, PromptGtAnswerDataset, apply_GenRM_template, rejection_sampling_processor, preprocess_box_response_for_qwen_prompt
+
+logger = logging.getLogger(__name__)
+
+
+def read_jsonl_to_list(args, file_path):
+    data_list = []
+    with open(file_path, 'r', encoding='utf-8') as file:
+        for line in file:
+            line = line.strip()
+            if line:
+                data_dict = json.loads(line)
+                data_list.append(data_dict)
+    logger.info(f"Successfully loaded JSON file from {file_path}...")
+    return data_list
 
 
 def clean_up():
@@ -141,11 +156,11 @@ def batch_GenRM_rejection_sampling(args):
             else:
                 example['select'] = True
 
-        judgement_prompt = apply_GenRM_template(prompt_text, response_text, gt_answer_text)
+        judgement_prompt = apply_GenRM_template(prompt_text, response_text, gt_answer_text, args.sampling_language)
         example['judgement_prompt'] = judgement_prompt
         return example
 
-    input_data = input_data.map(process_row)
+    input_data = input_data.map(process_row, num_proc=args.workers)
     if args.use_ground_truth_answer and args.use_rules:
         input_data = input_data.filter(lambda example: example['select'])
     judgement_prompts = [item['judgement_prompt'] for item in list(input_data)]
@@ -172,6 +187,18 @@ def batch_GenRM_rejection_sampling(args):
     clean_up()
 
 
+def batch_filter_rejection_sampling(args):
+    output_dataset = []
+    input_data = read_jsonl_to_list(args, args.dataset)
+    
+    for index in range(len(input_data)):
+        if int(input_data[index]["reward"]) >= args.reward_threshold:
+            output_dataset.append(input_data[index])
+
+    with jsonlines.open(args.output_path, mode="w") as writer:
+        writer.write_all(output_dataset)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--task", type=str, default=None, help="Set to generate_vllm or rejection_sampling")
@@ -180,10 +207,8 @@ if __name__ == "__main__":
     parser.add_argument("--use-rules", action="store_true", default=False)
     parser.add_argument("--map-keys", type=json.loads, default='{"prompt":"input","gt_answer":"gt_answer",'
                                                                '"response":"output"}', help="Dataset field mapping.")
-    # Models
     parser.add_argument("--pretrain", type=str, default=None, help="HF pretrain model name or path")
 
-    # Custom dataset
     parser.add_argument("--dataset", type=str, default=None)
     parser.add_argument("--dataset-probs", type=str, default="1.0")
     parser.add_argument("--dataset-split", type=str, default="train")
@@ -203,16 +228,19 @@ if __name__ == "__main__":
     parser.add_argument("--repetition-penalty", type=float, default=1.0, help="The parameter for repetition penalty. "
                                                                               "Between 1.0 and infinity. 1.0 means no penalty.")
     parser.add_argument("--best-of-n", type=int, default=1, help="Number of responses to generate per prompt")
-
-    # For vllm
     parser.add_argument("--tp-size", type=int, default=torch.cuda.device_count())
     parser.add_argument("--max-num-seqs", type=int, default=256)
+    parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--enable-prefix-caching", action="store_true", default=False)
 
     # For Iterative generation and Rejection Sampling
     parser.add_argument("--iter", type=int, default=None,
                         help="Used to slice the datasets in range iter * rollout_batch_size: (iter + 1) * rollout_batch_size", )
     parser.add_argument("--rollout-batch-size", type=int, default=2048, help="Number of samples to generate")
+    # Reject Sampling Prompt Language
+    parser.add_argument("--sampling-language", type=str, default="zh", help="Language of prompt to reject samples")
+    # Reward threshold for sampling result
+    parser.add_argument("--reward-threshold", type=int, default="5", help="Number of reward threshold to accept samples")
 
     args = parser.parse_args()
 
@@ -220,5 +248,7 @@ if __name__ == "__main__":
         batch_generate_vllm(args)
     elif args.task and args.task == "rejection_sampling":
         batch_GenRM_rejection_sampling(args)
+    elif args.task and args.task == "filter_sampling_result":
+        batch_filter_rejection_sampling(args)
     else:
         print("Invalid or missing '--task' argument. Please specify either 'vllm_generate' or 'rejection_sampling'.")
