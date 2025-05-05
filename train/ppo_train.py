@@ -68,7 +68,8 @@ class BufferItem:
 
 
 class PromptDataset(Dataset):
-    def __init__(self, prompt_list, actor_tokenizer, apply_chat_template=True):
+    def __init__(self, prompt_list, actor_tokenizer, apply_chat_template):
+        super().__init__()
         self.prompt_list = prompt_list
         self.actor_tokenizer = actor_tokenizer
         self.apply_chat_template = apply_chat_template
@@ -84,7 +85,7 @@ class PromptDataset(Dataset):
                 
             self.post_prompt_list.append(post_prompt)
     
-    def __init__(self):
+    def __len__(self):
         return len(self.post_prompt_list)
     
     def __getitem__(self, index):
@@ -146,8 +147,8 @@ def generate_samples(prompts, gt_list, model, max_length, max_new_tokens, n_samp
     model.eval()
     all_prompts = []
     all_gts = []
-    for index in len(prompts):
-        prompt = prompt[index]
+    for index in range(len(prompts)):
+        prompt = prompts[index]
         gt = gt_list[index]
         temp_prompt = [prompt] * n_samples_per_prompt
         temp_gt = [gt] * n_samples_per_prompt
@@ -165,7 +166,7 @@ def generate_samples(prompts, gt_list, model, max_length, max_new_tokens, n_samp
         input_ids = inputs["input_ids"]
         seqs = model.generate(
             input_ids=input_ids,
-            attention_mask=inputs["attention_mask"].to(device),
+            attention_mask=inputs["attention_mask"].to(model.device),
             max_new_tokens=max_new_tokens,
             eos_token_id=eos_token_id,
             pad_token_id=pad_token_id,
@@ -231,10 +232,10 @@ def generate_experiences(samples):
             ref_output = ref_model(seqs.to(ref_model.device), attention_mask=attention_mask.to(ref_model.device))
             ref_logits = ref_output.logits
             ref_log_probs = F.log_softmax(ref_logits[:, :-1, :], dim=-1)
-            ref_log_probs_labels = ref_log_probs.gather(dim=-1, index=seqs[:, 1:].unsqueeze(-1))
+            ref_log_probs_labels = ref_log_probs.gather(dim=-1, index=seqs.to(ref_model.device)[:, 1:].unsqueeze(-1))
             ref_action_log_probs = ref_log_probs_labels.squeeze(-1)[:, -num_actions:]
             # compute the values
-            value = critic_model.forward(seqs.to(critic_model.device), attention_mask.to(critic_model.device), num_actions.to(critic_model.device)).to(critic_model.device)
+            value = critic_model.forward(seqs.to(critic_model.device), attention_mask.to(critic_model.device), num_actions).to(critic_model.device)
             # compute the reward value at the output level
             seq_texts = actor_tokenizer.batch_decode(seqs, skip_special_tokens=True)
             reward_model_inputs = reward_tokenizer(seq_texts, return_tensors="pt", padding=True)
@@ -374,7 +375,9 @@ def collate_fn(batch):
 
 
 def compute_policy_loss(log_probs, old_log_probs, advantages, action_mask=None, clip_eps=0.2):
-    ratio = torch.exp(log_probs, old_log_probs)
+    clip_eps = torch.tensor(clip_eps)
+    advantages = advantages.to(log_probs.device)
+    ratio = (log_probs - old_log_probs).exp()
     surr1 = ratio * advantages
     surr2 = torch.clamp(1.0 - clip_eps, 1.0 + clip_eps) * advantages
     clipped_surrogate = -torch.min(surr1, surr2)
@@ -390,7 +393,7 @@ def compute_value_loss(values, old_values, returns, action_mask=None, clip_eps: 
         surr2 = (values - returns) ** 2
         loss = torch.max(surr1, surr2)
     else:
-        loss = (values - returns) ** 2
+        loss = (values - returns.to(values.device)) ** 2
         
     if action_mask is None:
         return loss.mean(-1).mean()
@@ -449,6 +452,12 @@ def train():
                 for experience in dataloader:
                     train_step(experience, steps)
                     steps += 1
+                    if steps >= 20:
+                        break
+                if steps >= 20:
+                    break
+            if steps >= 20:
+                break
             
             buffer.clear()
         
@@ -468,11 +477,12 @@ def get_advantages_and_returns(
     
     if action_mask is not None:
         values = action_mask * values
-        rewards = action_mask * rewards
+        rewards = action_mask.to(rewards.device) * rewards
     # [batch_size, response_length]
+    values = values.to(rewards.device)
 
-    for t in reversed(range(response_length)):
-        nextvalues = values[:, t+1] if t < response_length else 0.0
+    for t in range(response_length - 1, -1, -1):
+        nextvalues = values[:, t+1] if t < response_length - 1 else 0.0
         delta = rewards[:, t] + gamma * nextvalues - values[:, t]
         lastgaelam = delta + gamma * lambd * lastgaelam
         advantages_reversed.append(lastgaelam)
@@ -488,6 +498,10 @@ class CriticModel(nn.Module):
         self.base_model = base_model
         self.base_model.eval()
         self.value_head = nn.Linear(base_model.config.hidden_size, 1)
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
         
     def forward(self, input_ids, attention_mask, num_actions):
         hidden_size = self.base_model(input_ids, attention_mask=attention_mask).last_hidden_state
@@ -499,38 +513,54 @@ class CriticModel(nn.Module):
 if __name__ == "__main__":
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     # num of epoch
-    episodes = 3
-    max_epochs = 5
+    episodes = 1
+    # 生成一次经验，训练的轮数
+    max_epochs = 2
+    # 一次从提示词数据集中取多少条数据用于生成经验
     rollout_batch_size = 8
+    # 一次取多少条数据生成经验（生成经验需要多个模型推理，对显存要求高）
     micro_rollout_batch_size = 2
+    # 一个提示词生成多少个样本
     n_samples_per_prompt = 2
+    # 生成的最大长度，相当于最大动作数，数值越大，模型探索的可能性越多
     max_new_tokens = 50
+    # 最大长度
     max_length = 256
+    # 实际训练的batch_size大小，一次取多少条数据用于更新参数
     micro_train_batch_size = 2
+    # 记录日志
     writer = SummaryWriter('./runs')
-    actor_model = AutoModelForCausalLM.from_pretrained('/root/Qwen/Qwen2.5-1.5B-Instruct').to('cuda:0')
-    ref_model = AutoModelForCausalLM.from_pretrained('/root/Qwen/Qwen2.5-1.5B-Instruct').to('cuda:1')
-    reward_model = AutoModelForSequenceClassification.from_pretrained('/home/user/Downloads/reward-model-deberta-v3-large-v2').to('cuda:2')
-    actor_tokenizer = AutoTokenizer.from_pretrained('/root/Qwen/Qwen2.5-1.5B-Instruct')
-    reward_tokenizer = AutoTokenizer.from_pretrained('/home/user/Downloads/reward-model-deberta-v3-large-v2')
+    # 策略模型
+    actor_model = AutoModelForCausalLM.from_pretrained('/root/Qwen/Qwen3-0.6B-Base').to('cuda:0')
+    # 参考模型
+    ref_model = AutoModelForCausalLM.from_pretrained('/root/Qwen/Qwen3-0.6B-Base').to('cuda:1')
+    # 奖励模型
+    from transformers import AutoModelForSequenceClassification
+    reward_model = AutoModelForSequenceClassification.from_pretrained('/root/reward-model-deberta-v3-large-v2').to('cuda:2')
+    actor_tokenizer = AutoTokenizer.from_pretrained('/root/Qwen/Qwen3-0.6B-Base')
+    reward_tokenizer = AutoTokenizer.from_pretrained('/root/reward-model-deberta-v3-large-v2')
+    # 价值模型
     critic_model = CriticModel(actor_model.base_model).to('cuda:3')
     
+    # 初始化优化器
     optimizer_actor = torch.optim.Adam(actor_model.parameters(), lr=0.000003)
     optimizer_critic = torch.optim.Adam(critic_model.parameters(), lr=0.000005)
     
+    # 填充方式为左填充
     actor_tokenizer.padding_side = 'left'
     eos_token_id = actor_tokenizer.eos_token_id
     pad_token_id = actor_tokenizer.pad_token_id
     prompt_list = []
     gt_list = []
-    with open('/root/train_gsm8k.json', 'r') as file:
+    with open('/root/train_gsm8k_origin.json', 'r') as file:
         data = json.load(file)
     
     for index, item in enumerate(data):
         prompt_list.append(item['question'])
         gt_list.append(item['answer'].split('#### ')[-1])
 
-    prompts_dataset = PromptDataset(prompt_list, actor_tokenizer, apply_chat_template=True)
+    prompts_dataset = PromptDataset(prompt_list, actor_tokenizer, True)
     prompts_dataloader = DataLoader(prompts_dataset, batch_size=rollout_batch_size, shuffle=True)
    
     train()
+    actor_model.save_pretrained('./save')
