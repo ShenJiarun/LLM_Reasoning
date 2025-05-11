@@ -114,8 +114,7 @@ def batch_generate_vllm(args):
 
 
 def batch_GenRM_rejection_sampling(args):
-    input_data = pd.read_json(args.dataset, lines=True)
-    input_data = Dataset.from_pandas(input_data)
+    input_data = read_jsonl_to_list(args.dataset, lines=True)
 
     llm = LLM(
         model=args.pretrain,
@@ -160,7 +159,7 @@ def batch_GenRM_rejection_sampling(args):
         example['judgement_prompt'] = judgement_prompt
         return example
 
-    input_data = input_data.map(process_row, num_proc=args.workers)
+    input_data = input_data.map(process_row, num_proc=1)
     if args.use_ground_truth_answer and args.use_rules:
         input_data = input_data.filter(lambda example: example['select'])
     judgement_prompts = [item['judgement_prompt'] for item in list(input_data)]
@@ -199,6 +198,102 @@ def batch_filter_rejection_sampling(args):
         writer.write_all(output_dataset)
 
 
+def batch_generate_self_check(args):
+    class Empty:
+        pass
+
+    dummy_strategy = Empty()
+    dummy_strategy.print = print
+    dummy_strategy.is_rank_0 = dummy_is_rank_0
+    dummy_strategy.args = args
+
+    # configure tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(args.pretrain, trust_remote_code=True)
+
+    # configure model
+    llm = LLM(
+        model=args.pretrain,
+        tensor_parallel_size=args.tp_size,
+        trust_remote_code=True,
+        seed=args.seed,
+        max_num_seqs=args.max_num_seqs,
+        enable_prefix_caching=args.enable_prefix_caching,
+    )
+
+    # Create a sampling params object.
+    sampling_params = SamplingParams(
+        max_tokens=args.max_new_tokens,
+        top_p=args.top_p,
+        temperature=args.temperature,
+        repetition_penalty=args.repetition_penalty,
+        skip_special_tokens=False,
+        truncate_prompt_tokens=args.prompt_max_len,
+        include_stop_str_in_output=True,
+        stop='</think>',
+    )
+
+    prompts_data = blending_datasets(
+        args.dataset,
+        args.dataset_probs,
+        dummy_strategy,
+        args.seed,
+        max_count=args.max_samples,
+        train_split=args.dataset_split,
+    )
+
+    if args.iter is None:
+        prompts_data = prompts_data.select(range(min(args.max_samples, len(prompts_data))))
+    else:
+        # for iterative generation
+        start_idx = args.iter * args.rollout_batch_size
+        end_idx = start_idx + args.rollout_batch_size
+        prompts_data = prompts_data.select(range(start_idx, min(end_idx, len(prompts_data))))
+
+    input_template = args.input_template
+
+    dataset = PromptGtAnswerDataset(prompts_data, tokenizer, dummy_strategy, input_template=input_template)
+    prompts = [item["prompt"] for item in list(dataset)]
+    gt_answers = [item["gt_answer"] for item in list(dataset)]
+
+    # best of n
+    N = args.best_of_n
+    intermedia_output = []
+    output_dataset = []
+    wait = 'Wait'
+
+    outputs = llm.generate(prompts * N, sampling_params)
+
+    for i, output in enumerate(outputs[0].outputs):
+        if output.text.endswith('<|im_end|>'):
+            intermedia_res = output.text.replace('<|im_end|>', '')
+        else:
+            intermedia_res = output.text
+        intermedia_output.append(f'{intermedia_res} {wait}')
+    
+    sampling_params = SamplingParams(
+        max_tokens=args.max_new_tokens * 2,
+        top_p=args.top_p,
+        temperature=args.temperature,
+        repetition_penalty=args.repetition_penalty,
+        skip_special_tokens=False,
+        truncate_prompt_tokens=args.prompt_max_len * 2,
+        include_stop_str_in_output=True,
+    )
+
+    outputs = llm.generate(intermedia_output, sampling_params)
+
+    for output, gt_answer in zip(outputs, gt_answers * N):
+        prompt = output.prompt
+        output = output.outputs[0].text
+        output_dataset.append({"prompt": prompt, "output": output, "gt_answer": gt_answer})
+
+    with jsonlines.open(args.output_path, mode="w") as writer:
+        writer.write_all(output_dataset)
+
+    del llm
+    clean_up()
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--task", type=str, default=None, help="Set to generate_vllm or rejection_sampling")
@@ -230,7 +325,6 @@ if __name__ == "__main__":
     parser.add_argument("--best-of-n", type=int, default=1, help="Number of responses to generate per prompt")
     parser.add_argument("--tp-size", type=int, default=torch.cuda.device_count())
     parser.add_argument("--max-num-seqs", type=int, default=256)
-    parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--enable-prefix-caching", action="store_true", default=False)
 
     # For Iterative generation and Rejection Sampling
@@ -250,5 +344,7 @@ if __name__ == "__main__":
         batch_GenRM_rejection_sampling(args)
     elif args.task and args.task == "filter_sampling_result":
         batch_filter_rejection_sampling(args)
+    elif args.task and args.task == "reject_sampling_self_check":
+        batch_generate_self_check(args)
     else:
         print("Invalid or missing '--task' argument. Please specify either 'vllm_generate' or 'rejection_sampling'.")
