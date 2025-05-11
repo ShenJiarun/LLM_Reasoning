@@ -3,6 +3,7 @@ import gc
 import json
 import re
 import logging
+import copy
 
 import jsonlines
 import pandas as pd
@@ -254,6 +255,7 @@ def batch_generate_self_check(args):
     dataset = PromptGtAnswerDataset(prompts_data, tokenizer, dummy_strategy, input_template=input_template)
     prompts = [item["prompt"] for item in list(dataset)]
     gt_answers = [item["gt_answer"] for item in list(dataset)]
+    original_prompts = copy.deepcopy(prompts)
 
     # best of n
     N = args.best_of_n
@@ -263,12 +265,13 @@ def batch_generate_self_check(args):
 
     outputs = llm.generate(prompts * N, sampling_params)
 
-    for i, output in enumerate(outputs[0].outputs):
-        if output.text.endswith('<|im_end|>'):
-            intermedia_res = output.text.replace('<|im_end|>', '')
-        else:
-            intermedia_res = output.text
-        intermedia_output.append(f'{intermedia_res} {wait}')
+    for o in outputs:
+        for i, output in enumerate(o.outputs):
+            if output.text.endswith('<|im_end|>'):
+                intermedia_res = output.text.replace('<|im_end|>', '')
+            else:
+                intermedia_res = output.text
+            intermedia_output.append(f'{intermedia_res} {wait}')
     
     sampling_params = SamplingParams(
         max_tokens=args.max_new_tokens * 2,
@@ -282,10 +285,10 @@ def batch_generate_self_check(args):
 
     outputs = llm.generate(intermedia_output, sampling_params)
 
-    for output, gt_answer in zip(outputs, gt_answers * N):
+    for original_prompt, output, gt_answer in zip(original_prompts, outputs, gt_answers * N):
         prompt = output.prompt
         output = output.outputs[0].text
-        output_dataset.append({"prompt": prompt, "output": output, "gt_answer": gt_answer})
+        output_dataset.append({"prompt": original_prompt, "output": f'{prompt}{output}', "gt_answer": gt_answer})
 
     with jsonlines.open(args.output_path, mode="w") as writer:
         writer.write_all(output_dataset)
