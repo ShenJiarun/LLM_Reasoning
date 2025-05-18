@@ -3,7 +3,6 @@ import gc
 import json
 import re
 import logging
-import copy
 
 import jsonlines
 import pandas as pd
@@ -13,7 +12,14 @@ from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 from vllm.distributed.parallel_state import (destroy_distributed_environment, destroy_model_parallel)
 
-from utils import blending_datasets, PromptGtAnswerDataset, apply_GenRM_template, rejection_sampling_processor, preprocess_box_response_for_qwen_prompt
+from utils import (
+    blending_datasets,
+    PromptGtAnswerDataset,
+    apply_GenRM_template,
+    rejection_sampling_processor,
+    rejection_sampling_math_difficulty_processor,
+    preprocess_box_response_for_qwen_prompt
+)
 
 logger = logging.getLogger(__name__)
 
@@ -255,23 +261,24 @@ def batch_generate_self_check(args):
     dataset = PromptGtAnswerDataset(prompts_data, tokenizer, dummy_strategy, input_template=input_template)
     prompts = [item["prompt"] for item in list(dataset)]
     gt_answers = [item["gt_answer"] for item in list(dataset)]
-    original_prompts = copy.deepcopy(prompts)
 
     # best of n
-    N = args.best_of_n
+    N = 1
     intermedia_output = []
     output_dataset = []
     wait = 'Wait'
 
     outputs = llm.generate(prompts * N, sampling_params)
 
-    for o in outputs:
-        for i, output in enumerate(o.outputs):
-            if output.text.endswith('<|im_end|>'):
-                intermedia_res = output.text.replace('<|im_end|>', '')
-            else:
-                intermedia_res = output.text
-            intermedia_output.append(f'{intermedia_res} {wait}')
+    # print(f'The original output is {outputs}')
+
+    for i, output in enumerate(outputs[0].outputs):
+        # print(f"Original Output {i + 1}: {output.text}")
+        if output.text.endswith('<|im_end|>'):
+            intermedia_res = output.text.replace('<|im_end|>', '')
+        else:
+            intermedia_res = output.text
+        intermedia_output.append(f'{intermedia_res} {wait}')
     
     sampling_params = SamplingParams(
         max_tokens=args.max_new_tokens * 2,
@@ -285,13 +292,90 @@ def batch_generate_self_check(args):
 
     outputs = llm.generate(intermedia_output, sampling_params)
 
-    for original_prompt, output, gt_answer in zip(original_prompts, outputs, gt_answers * N):
+    # print(f'The new outputs are {outputs}')
+    for output, gt_answer in zip(outputs, gt_answers * N):
         prompt = output.prompt
         output = output.outputs[0].text
-        output_dataset.append({"prompt": original_prompt, "output": f'{prompt}{output}', "gt_answer": gt_answer})
+        output_dataset.append({"prompt": prompt, "output": output, "gt_answer": gt_answer})
 
     with jsonlines.open(args.output_path, mode="w") as writer:
         writer.write_all(output_dataset)
+
+    del llm
+    clean_up()
+
+
+def batch_GenRM_math_difficult_labels(args):
+    class Empty:
+        pass
+
+    dummy_strategy = Empty()
+    dummy_strategy.print = print
+    dummy_strategy.is_rank_0 = dummy_is_rank_0
+    dummy_strategy.args = args
+
+
+    llm = LLM(
+        model=args.pretrain,
+        tensor_parallel_size=args.tp_size,
+        trust_remote_code=True,
+        seed=args.seed,
+        max_num_seqs=args.max_num_seqs,
+        enable_prefix_caching=args.enable_prefix_caching,
+    )
+
+    # Create a sampling params object.
+    sampling_params = SamplingParams(
+        max_tokens=args.max_new_tokens,
+        top_p=args.top_p,
+        temperature=0,
+        repetition_penalty=args.repetition_penalty,
+        skip_special_tokens=False,
+        truncate_prompt_tokens=args.prompt_max_len,
+        include_stop_str_in_output=True,
+    )
+
+    prompts_data = blending_datasets(
+        args.dataset,
+        args.dataset_probs,
+        dummy_strategy,
+        args.seed,
+        max_count=args.max_samples,
+        train_split=args.dataset_split,
+    )
+
+    def process_row(example):
+        input_key = 'input'
+
+        example[input_key] = example[input_key].replace('<|im_end|>\n<|im_start|>assistant', '')
+        question_text = example[input_key]
+
+        judgement_prompt = apply_GenRM_template(args.task, question_text, language=args.sampling_language)
+        example['judgement_prompt'] = judgement_prompt
+        return example
+
+    input_data = prompts_data.map(process_row, num_proc=4)
+    if args.use_ground_truth_answer and args.use_rules:
+        input_data = input_data.filter(lambda example: example['select'])
+    judgement_prompts = [item['judgement_prompt'] for item in list(input_data)]
+    judgements = llm.generate(judgement_prompts, sampling_params)
+
+    output_dataset = []
+    for example, judgement in zip(input_data, judgements):
+        example["judgement"] = judgement.outputs[0].text
+        judgement_parsing = re.findall(r'<score>(-?\d+(?:\.\d+)?)</score>', example["judgement"])
+        if judgement_parsing:
+            example["reward"] = judgement_parsing[0]
+        else:
+            example["reward"] = '-1'
+        output_dataset.append(example)
+
+    output_dataset = rejection_sampling_math_difficulty_processor(output_dataset)
+
+    with jsonlines.open(args.output_path, mode="w") as writer:
+        writer.write_all(output_dataset)
+
+    print(f"Processing complete and data saved to '{args.output_path}'.")
 
     del llm
     clean_up()
@@ -349,5 +433,7 @@ if __name__ == "__main__":
         batch_filter_rejection_sampling(args)
     elif args.task and args.task == "reject_sampling_self_check":
         batch_generate_self_check(args)
+    elif args.task and args.task == "reject_sampling_math_difficult":
+        batch_GenRM_math_difficult_labels(args)
     else:
         print("Invalid or missing '--task' argument. Please specify either 'vllm_generate' or 'rejection_sampling'.")

@@ -125,7 +125,40 @@ class PromptGtAnswerDataset(Dataset):
         return {"prompt": self.prompts[idx], "gt_answer": self.gt_answers[idx]}
 
 
-def apply_GenRM_template(prompt_text, response_text, ground_truth_answer_text, language):
+def apply_GenRM_template(task, prompt_text, response_text=None, ground_truth_answer_text=False, language='en'):
+    if task == 'reject_sampling_math_difficult':
+        if language == "en":
+            full_input = f"""
+                    You are an expert in evaluating math problems based on their difficulty level. Your task is to analyze the following math question and provide a difficulty score. The difficulty score should be enclosed in <score></score> tags, where:
+                    - A score of 1 means the question is very easy (e.g., basic arithmetic).
+                    - A score of 2 means the question is relatively simple, but requires some thought (e.g., single-variable algebra).
+                    - A score of 3 means the question is moderately difficult, requiring multiple steps or knowledge of intermediate concepts (e.g., basic calculus or linear algebra).
+                    - A score of 4 means the question is challenging, requiring advanced knowledge or multiple complex steps (e.g., advanced calculus or multi-variable problems).
+                    - A score of 5 means the question is very difficult (e.g., complex calculus or advanced topics).
+                    Please consider factors such as the complexity of the problem, required knowledge, and the number of steps needed to solve it.
+
+                    Examples:
+                    1. Question: "What is 2 + 2?"
+                    Output: <score>1</score>
+
+                    2. Question: "What is the value of x if 2x + 3 = 7?"
+                    Output: <score>2</score>
+
+                    3. Question: "What is the derivative of 3x^2 + 2x?"
+                    Output: <score>3</score>
+
+                    4. Question: "Evaluate the integral of x^3 from 0 to 1."
+                    Output: <score>4</score>
+
+                    5. Question: "Find the critical points and classify them for the function f(x) = x^4 - 4x^3 + 6x^2."
+                    Output: <score>5</score>
+
+                    Now, please evaluate the following question:
+
+                    Question: "{prompt_text}"
+
+                    Please provide the difficulty score.
+                    """
     if ground_truth_answer_text:
         if language == "zh":
             full_input = f"""
@@ -239,6 +272,22 @@ def rejection_sampling_processor(objs):
                 out[prompt]["output"] = output
 
     return [{"prompt": k, "output": v["output"], "reward": v["reward"]} for k, v in out.items()]
+
+
+def rejection_sampling_math_difficulty_processor(objs):
+    out = {}
+    for obj in tqdm(objs, desc="Rejection Sampling process...."):
+        prompt = obj["input"]
+        reward = float(obj["reward"])
+
+        if reward > 0:
+            if prompt not in out:
+                out[prompt] = {"input": prompt, "reward": reward}
+            elif reward > out[prompt]["reward"]:
+                out[prompt]["reward"] = reward
+                out[prompt]["input"] = prompt
+
+    return [{"prompt": k, "difficulty": v["reward"]} for k, v in out.items()]
 
 
 def qwen_math_equal_subprocess(prediction, reference, timeout_seconds=10):
