@@ -3,9 +3,9 @@
 **LLM \_Reasoning** is a *minimal, end‑to‑end recipe* for giving large‑language‑models stronger mathematical‑reasoning skills.
 It shows how to
 
-1. **Re‑annotate raw math datasets** into Chain‑of‑Thought‑style (CoT) records (🗂 `data_process/`) ([github.com][1])
-2. **Fine‑tune a base model** with supervised CoT (🗂 `train/`) ([github.com][2])
-3. **Train a reward model** and **run rejection sampling** to automatically filter low‑quality traces (🗂 `reward_model/`, `reject_sampling/`) ([github.com][3])
+1. **Re‑annotate raw math datasets** into Chain‑of‑Thought‑style (CoT) records (🗂 `data_process`)
+2. **Fine‑tune a base model** with supervised CoT (🗂 `train`)
+3. **Train a reward model** and **run rejection sampling** to automatically filter low‑quality traces (🗂 `reward_model`, `reject_sampling`)
 
 The repo is intentionally lightweight—only Python + Shell scripts—so you can slot it into any larger alignment workflow.
 
@@ -79,10 +79,22 @@ check `reject_sampling/sample.py` for further inferencing!
 
 ---
 
+## 🛹 Reject Sampling
+
+`generate_vllm`: Do sampling, for the single prompt give N generate result
+
+`rejection_sampling`: Normal rejection sampling, let the teacher model to give each of the N results in the previous stages
+
+`filter_sampling_result`: Give a reward threshold to filter previous results
+
+`reject_sampling_self_check`: For each of the input data, let the cute LLM do the self-checking 🥺
+
+`reject_sampling_math_difficult`: For each of the given math questions, let LLM identify the difficulty level 😎
+
 ## 🧪 Evaluation
 
 The repo does not hard‑code a benchmark to stay framework‑agnostic.
-*Suggested*: run **MATH datasets exact‑answer accuracy** or **BIG‑Bench\_hard** on the filtered outputs, and compare to the base model.
+*Suggested*: run **MATH datasets exact‑answer accuracy** or **GSM8k** on the filtered outputs, and compare to the base model.
 
 ---
 
