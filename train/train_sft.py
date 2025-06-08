@@ -250,7 +250,7 @@ def train():
     with training_args.main_process_first(desc="loading and tokenization"):
 
         train_dataset = make_train_dataset(
-            tokenizer=tokenizer, data_path="/root/3b56.json", data_args=data_args)
+            tokenizer=tokenizer, data_path="reason_cot_data.parquet", data_args=data_args)
 
     data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model,
                                            label_pad_token_id=IGNORE_INDEX

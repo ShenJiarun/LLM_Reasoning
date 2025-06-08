@@ -1,4 +1,4 @@
-python train/sft.py \
+python train/train_sft.py \
     --bf16 true \
     --fp16 false \
     --output_dir output_test \
