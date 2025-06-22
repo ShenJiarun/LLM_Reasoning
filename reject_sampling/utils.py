@@ -17,6 +17,24 @@ from torch.utils.data import Dataset
 from tqdm import tqdm
 
 
+separate_template="""Separate the following multi-step math problem into two questions. The answer to the first question should be a value that is then given as known information in the second question. For each question, provide the ground truth answer.
+
+Example:
+
+Original problem:
+Tobias is buying a new pair of shoes that costs \$95. He has been saving up his money each month for the past three months. He gets a \$5 allowance a month. He also mows lawns and shovels driveways. He charges \$15 to mow a lawn and \$7 to shovel. After buying the shoes, he has \$15 in change. If he mows 4 lawns, how many driveways did he shovel?
+
+1. Tobias is buying a new pair of shoes that costs \$95. After buying the shoes, he has \$15 left. How much money did Tobias save in total?
+Ground truth answer: \$110
+
+2. Tobias saved a total of \$110 over the past three months. He gets a \$5 allowance per month. He also earned money by mowing lawns (\$15 each) and shoveling driveways (\$7 each). If he mowed 4 lawns, how many driveways did he shovel?
+Ground truth answer: 5 driveways
+
+Now, generate a new question pair using a similar structure:
+{question}
+"""
+
+
 def blending_datasets(
         datasets,
         probabilities,
