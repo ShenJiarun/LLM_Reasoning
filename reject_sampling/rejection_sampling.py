@@ -19,7 +19,8 @@ from utils import (
     apply_GenRM_template,
     rejection_sampling_processor,
     rejection_sampling_math_difficulty_processor,
-    preprocess_box_response_for_qwen_prompt
+    preprocess_box_response_for_qwen_prompt,
+    separate_template
 )
 
 logger = logging.getLogger(__name__)
@@ -380,6 +381,95 @@ def batch_GenRM_math_difficult_labels(args):
     clean_up()
 
 
+def batch_gen_seqarate_math_questions(args):
+    input_dataset = load_dataset('parquet', data_files=args.dataset)
+
+    llm = LLM(
+        model=args.pretrain,
+        tensor_parallel_size=args.tp_size,
+        trust_remote_code=True,
+        seed=args.seed,
+        max_num_seqs=args.max_num_seqs,
+        enable_prefix_caching=args.enable_prefix_caching,
+    )
+
+    sampling_params = SamplingParams(
+        max_tokens=args.max_new_tokens,
+        top_p=args.top_p,
+        temperature=0,
+        repetition_penalty=args.repetition_penalty,
+        skip_special_tokens=False,
+        truncate_prompt_tokens=args.prompt_max_len,
+        include_stop_str_in_output=True,
+    )
+
+    def match_whole_question_pair(text):
+        pattern = r"### QUESTION_PAIR_START ###(.*?)### QUESTION_PAIR_END ###"
+        match = re.search(pattern, text, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+        return None
+
+
+    def extract_questions_and_answers(text):
+        pattern = r"(\d+)\. Question: (.*?)\nAnswer: (.*?)(?=\n\d+\. Question:|###)"
+        matches = re.findall(pattern, text, re.DOTALL)
+        result = []
+        for q_num, q_text, answer in matches:
+            result.append((int(q_num), q_text.strip(), answer.strip()))
+        return result
+
+
+    def extract_answers(text):
+        pattern = r"Answer: (.*?)(?=\n|$)"
+        return [ans.strip() for ans in re.findall(pattern, text)]
+
+    def grep_question_and_answer_pair(sample_output):
+        result_pair = []
+        whole_match = match_whole_question_pair(sample_output)
+        if whole_match:
+            pass
+        else:
+            return None
+
+        questions = extract_questions_and_answers(sample_output)
+        question_number = 1
+        for q_text, answer in questions:
+            result_pair.append({'Question{question_number}': q_text, 'answer':answer })
+            question_number += 1
+        
+        return result_pair
+
+    def process_row(example):
+        example['question'] = separate_template.format(question=example['question'])
+        prompt_answer = example['answer']
+        example['ground_truth'] = prompt_answer.split('#### ')[1]
+        return example
+
+    input_dataset = input_dataset.map(process_row, num_proc=1)['train']
+    judgement_prompts = [item['question'] for item in list(input_dataset)][:3]
+    judgements = llm.generate(judgement_prompts, sampling_params)
+
+    output_dataset = []
+    for example, judgement in zip(input_dataset, judgements):
+        judgement_parsing = None
+        example["judgement"] = judgement.outputs[0].text
+        judgement_parsing = grep_question_and_answer_pair(example["judgement"])
+        if judgement_parsing is not None:
+            example["reward"] = judgement_parsing[0]
+        else:
+            example["reward"] = '-1'
+        output_dataset.append(example)
+
+    with jsonlines.open(args.output_path, mode="w") as writer:
+        writer.write_all(output_dataset)
+
+    print(f"Processing complete and data saved to '{args.output_path}'.")
+
+    del llm
+    clean_up()
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--task", type=str, default=None, help="Set to generate_vllm or rejection_sampling")
@@ -434,5 +524,7 @@ if __name__ == "__main__":
         batch_generate_self_check(args)
     elif args.task and args.task == "reject_sampling_math_difficult":
         batch_GenRM_math_difficult_labels(args)
+    elif args.task and args.task == "seqarate_math_questions":
+        batch_gen_seqarate_math_questions(args)
     else:
         print("Invalid or missing '--task' argument. Please specify either 'vllm_generate' or 'rejection_sampling'.")
