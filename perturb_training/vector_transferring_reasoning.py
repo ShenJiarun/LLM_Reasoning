@@ -19,14 +19,14 @@ param_dtype = torch.bfloat16 if use_cuda else torch.float32
 # ----------------------------
 BASE = "/data/home/Jiarun/LLaMA-Factory/model_from_hf/Qwen2.5-Math-7B"
 POST = "/data/home/Jiarun/LLaMA-Factory/model_from_hf/DeepSeek-R1-Distill-Qwen-7B"
-DATA = "/data/home/Jiarun/LLaMA-Factory/Math-500/train-00000-of-00001-Math-500.parquet"
+DATA = "/data/home/Jiarun/LLaMA-Factory/deepscaler.json"
 MAX_LEN = 8192  # or 16384
 BATCH_SIZE = 1
 LR = 1e-2
 TR_LAMBDA = 1e-3
 STEPS = 1500
 LOG_EVERY = 1
-SAVE_DIR = f"./ckpt/1_5x_perturbed_training_remove_wasted_padding_steps{STEPS}_Math_500_{MAX_LEN}"
+SAVE_DIR = f"./ckpt/1_5x_perturbed_training_remove_wasted_padding_steps{STEPS}_deepscaler_{MAX_LEN}"
 
 # New hyperparameters for improved TR control
 S_TARGET = 1.0  # Target scale (sigmoid(0) * 1.5 = 0.75, so we aim for ~1.0)
@@ -156,7 +156,7 @@ def preprocess_function(examples):
 
 dataset = load_dataset(DATA.split('.')[-1], data_files=DATA, split="train")
 processed = dataset.map(preprocess_function, batched=True, remove_columns=dataset.column_names,
-                        desc="Tokenizing Math-500 dataset")
+                        desc="Tokenizing DeepScalerR dataset")
 
 def collate_fn(batch):
     max_len_in_batch = max(len(b["input_ids"]) for b in batch)
@@ -184,14 +184,9 @@ def collate_fn(batch):
 loader = DataLoader(processed, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn, pin_memory=True)
 print("Dataset ready with dynamic padding.")
 
-
 optimizer = torch.optim.AdamW(alpha_params, lr=LR, weight_decay=0.0)  # No default weight decay
 base_model.train()
 
-
-# ----------------------------
-# Improved TR Penalty Computation
-# ----------------------------
 def compute_improved_tr_penalty(model, s_target, s_min, s_max, margin, alpha_reg, device):
     """
     Compute improved TR penalty with:
@@ -221,28 +216,31 @@ def compute_improved_tr_penalty(model, s_target, s_min, s_max, margin, alpha_reg
                     upper_bound = s_target * (1 + margin)
                     
                     if s_clipped < lower_bound:
-                        # Penalty for being too small
+                        # Penalty for lambda being too small
                         penalty = (lower_bound - s_clipped) ** 2
                     elif s_clipped > upper_bound:
                         # Stronger penalty for being too large (2x weight)
                         penalty = 2.0 * (s_clipped - upper_bound) ** 2
                     else:
                         # Within acceptable range
-                        penalty = torch.tensor(0.0, device=device, dtype=s.dtype)
-                    
-                    penalty_terms.append(penalty)
-                    scale_values.append(s_clipped.detach())
-                    alpha_values.append(pr.alpha.detach())
+                        penalty = torch.tensor(0.0, device=s.device, dtype=s.dtype)
+
+                    penalty_terms.append(penalty.detach().cpu())
+                    scale_values.append(s_clipped.detach().cpu())
+                    alpha_values.append(pr.alpha.detach().cpu())
     
-    # Average penalty across all parameters
-    tr_penalty = torch.stack(penalty_terms).mean() if penalty_terms else torch.tensor(0.0, device=device)
+    # Average penalty across all parameters (all on CPU now)
+    if penalty_terms:
+        tr_penalty = torch.stack(penalty_terms).mean().to(device)
+    else:
+        tr_penalty = torch.tensor(0.0, device=device)
     
-    # L2 regularization on alpha parameters
+    # L2 regularization on alpha parameters (compute on CPU then move to device)
     alpha_reg_loss = torch.tensor(0.0, device=device)
     if alpha_values:
-        alpha_reg_loss = alpha_reg * torch.stack([a ** 2 for a in alpha_values]).mean()
+        alpha_reg_loss = (alpha_reg * torch.stack([a ** 2 for a in alpha_values]).mean()).to(device)
     
-    # Statistics for logging
+    # Statistics for logging (already on CPU)
     stats = {}
     if scale_values:
         scale_tensor = torch.stack(scale_values)
