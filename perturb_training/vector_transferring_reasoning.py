@@ -1,25 +1,27 @@
-import os, math, gc, time
+import os
+import gc
+import math
+import time
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils import parametrize
 from torch.utils.data import DataLoader
-from datasets import load_dataset
 
+from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
+
 
 torch.manual_seed(1234)
 use_cuda = torch.cuda.is_available()
-param_dtype = torch.bfloat16 if use_cuda else torch.float32
+param_dtype = torch.bfloat16
 
-# ----------------------------
 # Config
-# ----------------------------
 BASE = "/shenjiarun/model_from_hf/Qwen2.5-Math-7B"
 POST = "/shenjiarun/model_from_hf/DeepSeek-R1-Distill-Qwen-7B"
-DATA = "/shenjiarun/dataset/reason_cot_data.json"
-MAX_LEN = 16384  # or 16384
+DATA = "/shenjiarun/dataset/deepscaler.json"
+MAX_LEN = 8192  # or 16384
 BATCH_SIZE = 1
 LR = 1e-4
 TR_LAMBDA = 1e-3
@@ -27,16 +29,12 @@ STEPS = 2000
 LOG_EVERY = 1
 SAVE_DIR = f"./ckpt/Qwen2.5_Math_7B_2x_LR_{LR}_{time.ctime().replace(' ', '_')}perturbed_training_steps{STEPS}_OpenR1_Math_220k_{MAX_LEN}"
 
-# ----------------------------
-# Tokenizer
-# ----------------------------
+# Load Tokenizer
 tok = AutoTokenizer.from_pretrained(POST, use_fast=True)
 if tok.pad_token is None:
     tok.pad_token = tok.eos_token
 
-# ----------------------------
-# Load sharded models on multiple GPUs
-# ----------------------------
+# Load sharded models on multiple GPUs using auto mapping
 base_model = AutoModelForCausalLM.from_pretrained(
     BASE, torch_dtype=param_dtype, device_map="auto", low_cpu_mem_usage=True
 )
@@ -46,9 +44,7 @@ post_model = AutoModelForCausalLM.from_pretrained(
 base_model.eval()
 post_model.eval()
 
-# ----------------------------
 # Build name->param dicts (match by identical keys)
-# ----------------------------
 def named_params_dict(model: nn.Module):
     return {n: p for n, p in model.named_parameters()}
 
@@ -56,9 +52,7 @@ base_params = named_params_dict(base_model)
 post_params = named_params_dict(post_model)
 assert set(base_params.keys()) == set(post_params.keys()), "Param keys mismatch."
 
-# ----------------------------
 # Parametrization: W = W_base + (torch.sigmoid(self.alpha) * 2.0) * Delta
-# ----------------------------
 class BlendDelta(nn.Module):
     def __init__(self, delta: torch.Tensor, delta_norm2: float):
         super().__init__()
@@ -94,14 +88,14 @@ for name, b in base_params.items():
     mod = base_model.get_submodule(mod_name)
     parametrize.register_parametrization(mod, param_name, blend)
 
-    alpha_params.append(blend.alpha)
+    alpha_params.append(blend)
 
 print(f"Registered {len(alpha_params)} trainable scalars over {sum(p.numel() for p in base_model.parameters())} weights.")
 
 def preprocess_function(examples):
-    inputs = [str(q) for q in examples["instruction"]]
+    inputs = [str(q) for q in examples["problem"]]
     # Use the FULL answer including reasoning steps
-    targets = [str(a) for a in examples["output"]]
+    targets = [str(a) for a in examples["solution"]]
 
     # Tokenize without padding first
     tok_inp = tok(inputs, truncation=False, add_special_tokens=True)
@@ -134,7 +128,7 @@ def preprocess_function(examples):
 
 dataset = load_dataset(DATA.split('.')[-1], data_files=DATA, split="train")
 processed = dataset.map(preprocess_function, batched=True, remove_columns=dataset.column_names,
-                        desc="Tokenizing Math-500 dataset")
+                        desc="Tokenizing dataset...")
 
 def collate_fn(batch):
     max_len_in_batch = max(len(b["input_ids"]) for b in batch)
@@ -162,8 +156,7 @@ def collate_fn(batch):
 loader = DataLoader(processed, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn, pin_memory=True)
 print("Dataset ready with dynamic padding.")
 
-
-optimizer = torch.optim.AdamW(alpha_params, lr=LR, weight_decay=0.05)
+optimizer = torch.optim.AdamW([p.alpha for p in alpha_params], lr=LR, weight_decay=0.05)
 base_model.train()
 
 def train(max_steps=STEPS, tr_lambda=TR_LAMBDA, log_every=LOG_EVERY):
@@ -178,7 +171,39 @@ def train(max_steps=STEPS, tr_lambda=TR_LAMBDA, log_every=LOG_EVERY):
             batch = {k: v.to(first_device, non_blocking=True) for k, v in batch.items()}
 
             optimizer.zero_grad(set_to_none=True)
+            # 1. Forward pass with current alpha (The perturbed model)
             out = base_model(**batch)
+            logits_perturbed = out.logits
+
+            # 2. Forward pass with alpha=0 (The pure Base model) - NO GRAD NEEDED
+            with torch.no_grad():
+                # Store current alphas
+                saved_alphas = [pr.alpha.data.clone() for pr in alpha_params]
+                
+                # Zero out alphas to simulate base model
+                for pr in alpha_params:
+                    pr.alpha.data.fill_(-100.0) # Sigmoid(-100) approx 0
+                    
+                output_post = post_model(**batch)
+                logits_post = output_post.logits
+                
+                # Restore alphas
+                for i, pr in enumerate(alpha_params):
+                    pr.alpha.data.copy_(saved_alphas[i])
+
+            # 3. Calculate Loss
+            loss_ce = out.loss # cross entropy loss
+
+            # Calculate KL Divergence Loss
+            probs_pert = F.log_softmax(logits_perturbed, dim=-1)
+            probs_post = F.softmax(logits_post, dim=-1)
+
+            # KL(P || Q) = sum(p * (log p - log q))
+            loss_kl = F.kl_div(probs_pert, probs_post, reduction='batchmean')
+
+            # 4. Total Loss
+            # BETA is a hyperparam (e.g., 0.1 or 0.5) controlling how much to hug the base model
+            BETA = 1
             loss = out.loss
 
             # Trust-region penalty
@@ -195,10 +220,11 @@ def train(max_steps=STEPS, tr_lambda=TR_LAMBDA, log_every=LOG_EVERY):
             
             tr_penalty = torch.stack(s_sq_terms).mean() if s_sq_terms else torch.tensor(0.0, device=first_device, dtype=loss.dtype)
 
-            (loss + tr_lambda * tr_penalty).backward()
+            loss_total = loss_ce + BETA * loss_kl + tr_lambda * tr_penalty
+            loss_total.backward()
             optimizer.step()
 
-            running += loss.item()
+            running += loss_total.item()
             if step % log_every == 0:
                 with torch.no_grad():
                     sigmas = []
