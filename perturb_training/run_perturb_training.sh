@@ -1,0 +1,13 @@
+python perturb_training/train_perturb.py \
+  --base Qwen/Qwen2.5-Math-7B \
+  --post deepseek-ai/DeepSeek-R1-Distill-Qwen-7B \
+  --data /home/ubuntu/date/sjr/LLM_Reasoning/deepscaler.json \
+  --max-len 8192 \
+  --batch-size 1 \
+  --lr 1e-4 \
+  --tr-lambda 1e-3 \
+  --beta 0.1 \
+  --steps 2000 \
+  --log-every 1 \
+  --dtype bf16 \
+  --device-map auto
