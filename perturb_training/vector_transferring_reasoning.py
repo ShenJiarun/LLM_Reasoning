@@ -18,16 +18,16 @@ use_cuda = torch.cuda.is_available()
 param_dtype = torch.bfloat16
 
 # Config
-BASE = "/shenjiarun/model_from_hf/Qwen2.5-Math-7B"
-POST = "/shenjiarun/model_from_hf/DeepSeek-R1-Distill-Qwen-7B"
-DATA = "/shenjiarun/dataset/deepscaler.json"
+BASE = "/lixiao/shenjiarun/model_from_hf/Qwen2.5-Math-7B"
+POST = "/lixiao/shenjiarun/model_from_hf/DeepSeek-R1-Distill-Qwen-7B"
+DATA = "/lixiao/shenjiarun/dataset/deepscaler.json"
 MAX_LEN = 8192  # or 16384
 BATCH_SIZE = 1
 LR = 1e-4
 TR_LAMBDA = 1e-3
 STEPS = 2000
 LOG_EVERY = 1
-SAVE_DIR = f"./ckpt/Qwen2.5_Math_7B_2x_LR_{LR}_{time.ctime().replace(' ', '_')}perturbed_training_steps{STEPS}_OpenR1_Math_220k_{MAX_LEN}"
+SAVE_DIR = f"./ckpt/Qwen2.5_Math_7B_2x_LR_{LR}_{time.ctime().replace(' ', '_')}_perturbed_training_steps{STEPS}_deepscaler_Seq{MAX_LEN}"
 
 # Load Tokenizer
 tok = AutoTokenizer.from_pretrained(POST, use_fast=True)
@@ -184,8 +184,8 @@ def train(max_steps=STEPS, tr_lambda=TR_LAMBDA, log_every=LOG_EVERY):
                 for pr in alpha_params:
                     pr.alpha.data.fill_(-100.0) # Sigmoid(-100) approx 0
                     
-                output_post = post_model(**batch)
-                logits_post = output_post.logits
+                output_base = base_model(**batch)
+                logits_base = output_base.logits
                 
                 # Restore alphas
                 for i, pr in enumerate(alpha_params):
@@ -196,14 +196,14 @@ def train(max_steps=STEPS, tr_lambda=TR_LAMBDA, log_every=LOG_EVERY):
 
             # Calculate KL Divergence Loss
             probs_pert = F.log_softmax(logits_perturbed, dim=-1)
-            probs_post = F.softmax(logits_post, dim=-1)
+            probs_base = F.softmax(logits_base, dim=-1)
 
             # KL(P || Q) = sum(p * (log p - log q))
-            loss_kl = F.kl_div(probs_pert, probs_post, reduction='batchmean')
+            loss_kl = F.kl_div(probs_pert, probs_base, reduction='batchmean')
 
             # 4. Total Loss
             # BETA is a hyperparam (e.g., 0.1 or 0.5) controlling how much to hug the base model
-            BETA = 1
+            BETA = 0.25
             loss = out.loss
 
             # Trust-region penalty
@@ -236,7 +236,8 @@ def train(max_steps=STEPS, tr_lambda=TR_LAMBDA, log_every=LOG_EVERY):
                                     sigmas.append((torch.sigmoid(pr.alpha) * 2.0).detach().float().cpu())
                     smean = torch.stack(sigmas).mean().item() if sigmas else 0.0
                     smax = torch.stack(sigmas).max().item() if sigmas else 0.0
-                print(f"step={step}, loss={running/log_every:.4f}, lambda_mean={smean:.4f}, lambda_max={smax:.4f}")
+                    smin = torch.stack(sigmas).min().item() if sigmas else 0.0
+                print(f"{{step: {step}, loss: {running/log_every:.4f}, lambda_mean: {smean:.4f}, lambda_max: {smax:.4f}, lambda_min: {smin:.4f}, loss_kl: {(BETA * loss_kl.item()):.4f}, loss_ce={loss_ce.item():.4f}, tr_penalty: {tr_penalty.item():.4f}}}")
                 running = 0.0
 
             if step >= max_steps:
