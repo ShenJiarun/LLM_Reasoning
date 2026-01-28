@@ -1,3 +1,4 @@
+# utils.py
 import os
 import time
 from contextlib import contextmanager
@@ -233,9 +234,47 @@ def compute_tr_penalty(alpha_modules: List[BlendDelta], device: torch.device, dt
     return torch.stack(terms).mean()
 
 
-def default_save_dir(prefix: str, lr: float, steps: int, max_len: int) -> str:
+def compute_asymmetric_tr_penalty(
+    alpha_modules: List[BlendDelta], 
+    device: torch.device, 
+    dtype: torch.dtype,
+    extrapolation_penalty: float = 2.0
+) -> torch.Tensor:
+    """
+    Asymmetric trust-region penalty that penalizes s > 1 more heavily.
+    """
+    if not alpha_modules:
+        return torch.tensor(0.0, device=device, dtype=dtype)
+    terms = []
+    for m in alpha_modules:
+        s = torch.sigmoid(m.alpha) * 2.0
+        # Penalize extrapolation (s > 1) more heavily
+        penalty_weight = torch.where(s > 1.0, extrapolation_penalty, 1.0)
+        terms.append((penalty_weight * s * s * m.delta_norm2).to(device=device, dtype=dtype))
+    return torch.stack(terms).mean()
+
+
+@torch.no_grad()
+def compute_entropy(logits: torch.Tensor, mask: Optional[torch.Tensor] = None) -> float:
+    """
+    Compute average token-level entropy.
+    logits: [batch, seq_len, vocab]
+    mask: [batch, seq_len] (1 for valid tokens, 0 for padding)
+    """
+    probs = F.softmax(logits, dim=-1)
+    log_probs = F.log_softmax(logits, dim=-1)
+    entropy = -(probs * log_probs).sum(dim=-1)  # [batch, seq_len]
+    
+    if mask is not None:
+        entropy = entropy * mask
+        return (entropy.sum() / mask.sum()).item()
+    else:
+        return entropy.mean().item()
+
+
+def default_save_dir(prefix: str, objective: str, lr: float, steps: int, max_len: int) -> str:
     stamp = time.strftime("%Y%m%d_%H%M%S")
-    return f"./ckpt/{prefix}_LR_{lr}_steps{steps}_Seq{max_len}_{stamp}"
+    return f"./ckpt/{prefix}_{objective}_LR_{lr}_steps{steps}_Seq{max_len}_{stamp}"
 
 
 def bake_and_save(model: nn.Module, tok, save_dir: str) -> None:
@@ -264,3 +303,52 @@ def load_model(
         device_map=device_map,
         low_cpu_mem_usage=low_cpu_mem_usage,
     )
+
+
+@torch.no_grad()
+def compute_kl_divergence(
+    logits_p: torch.Tensor,
+    logits_q: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+    reduction: str = "batchmean"
+) -> torch.Tensor:
+    """
+    Compute KL(P||Q) where P is the current policy and Q is the reference.
+    logits_p: [batch, seq_len, vocab] - current policy
+    logits_q: [batch, seq_len, vocab] - reference policy
+    mask: [batch, seq_len] - attention mask
+    """
+    log_p = F.log_softmax(logits_p, dim=-1)
+    p = F.softmax(logits_p, dim=-1)
+    log_q = F.log_softmax(logits_q, dim=-1)
+    
+    # KL(P||Q) = sum_i P(i) * (log P(i) - log Q(i))
+    kl = (p * (log_p - log_q)).sum(dim=-1)  # [batch, seq_len]
+    
+    if mask is not None:
+        kl = kl * mask
+        if reduction == "batchmean":
+            return kl.sum() / mask.sum()
+        elif reduction == "mean":
+            return kl.mean()
+        elif reduction == "sum":
+            return kl.sum()
+    else:
+        if reduction == "batchmean":
+            return kl.mean()
+        elif reduction == "mean":
+            return kl.mean()
+        elif reduction == "sum":
+            return kl.sum()
+    
+    return kl
+
+
+def temperature_scaled_softmax(logits: torch.Tensor, temperature: float) -> torch.Tensor:
+    """Apply temperature scaling to logits before softmax."""
+    return F.softmax(logits / temperature, dim=-1)
+
+
+def temperature_scaled_log_softmax(logits: torch.Tensor, temperature: float) -> torch.Tensor:
+    """Apply temperature scaling to logits before log_softmax."""
+    return F.log_softmax(logits / temperature, dim=-1)
