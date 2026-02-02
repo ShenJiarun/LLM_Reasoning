@@ -1,0 +1,12 @@
+CUDA_VISIBLE_DEVICES=2,3 vllm serve /home/ubuntu/date/sjr/model_from_hf/DeepSeek-R1-0528-Qwen3-8B/ \
+  --host 0.0.0.0 \
+  --port 9000 \
+  --dtype float16 \
+  --tensor-parallel-size 2 \
+  --gpu-memory-utilization 0.90 \
+  --max-model-len 4096 \
+  --trust-remote-code \
+  --disable-log-requests \
+  --served-model-name deepseek_r1_qwen3_8b \
+  --enable-auto-tool-choice \
+  --tool-call-parser hermes
